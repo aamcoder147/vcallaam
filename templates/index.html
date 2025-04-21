@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Flask WebRTC Call</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; }
+        video { border: 1px solid black; width: 320px; height: 240px; margin: 5px; background: #333; }
+        .videos { display: flex; justify-content: center; margin-bottom: 10px;}
+        .controls button { padding: 10px; margin: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Flask WebRTC Simple Calling</h1>
+    <div class="videos">
+        <div>
+            <p>Local Video</p>
+            <video id="localVideo" autoplay muted playsinline></video>
+        </div>
+        <div>
+            <p>Remote Video</p>
+            <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="startButton">Start Camera</button>
+        <button id="callButton" disabled>Call</button>
+        <button id="hangupButton" disabled>Hang Up</button>
+    </div>
+
+    <!-- Socket.IO Client Library (ensure version compatibility if needed) -->
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    <!-- Our WebRTC Logic -->
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
