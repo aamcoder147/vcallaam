@@ -1,115 +1,116 @@
 'use strict';
 
 // Get references to HTML elements
-const startButton = document.getElementById('startButton');
+const startMicButton = document.getElementById('startMicButton');
 const callButton = document.getElementById('callButton');
 const hangupButton = document.getElementById('hangupButton');
-const localVideo = document.getElementById('localVideo');
-const remoteVideo = document.getElementById('remoteVideo');
+const remoteAudio = document.getElementById('remoteAudio');
+const statusDiv = document.getElementById('status');
 
 // --- State Variables ---
-let localStream;        // Our own video/audio stream
-let remoteStream;       // The remote peer's stream
+let localStream;        // Our own audio stream
+let remoteStream;       // The remote peer's stream (kept for reference/cleanup)
 let peerConnection;     // RTCPeerConnection object
 let isCaller = false;   // Are we the one initiating the call?
 
+// --- Utility Function ---
+function updateStatus(message) {
+    console.log("Status:", message); // Log to console as well
+    statusDiv.textContent = message;
+}
+
 // --- Socket.IO Setup ---
-// Connect to the Flask-SocketIO server
-// Use window.location.origin if Flask is serving on the same host/port
-// Or specify manually e.g., 'http://localhost:5000'
 const socket = io(window.location.origin);
 
 socket.on('connect', () => {
     console.log('Socket connected!', socket.id);
+    updateStatus('Connected to server. Ready.');
+    startMicButton.disabled = false; // Enable mic button once connected
 });
 
 socket.on('disconnect', (reason) => {
     console.log(`Socket disconnected: ${reason}`);
-    // Handle potential cleanup if needed
-    handleHangup(); // Clean up call state if disconnected abruptly
+    updateStatus(`Server disconnected: ${reason}`);
+    handleHangup(false); // Clean up call state, don't send 'bye'
+    startMicButton.disabled = true;
+    callButton.disabled = true;
+    hangupButton.disabled = true;
 });
 
 socket.on('user-left', (data) => {
     console.log(`User left: ${data.sid}`);
-    // If the user who left was the one we were talking to
-    // You might need more robust logic here to track which SID is the remote peer
-    if (remoteStream) { // Simple check: if we have a remote stream, assume it was them
-       console.log("Remote peer left, hanging up.");
-       handleHangup();
+    if (peerConnection) { // Simple check: if we are in a call
+       updateStatus("Remote peer left. Call ended.");
+       handleHangup(false); // Clean up without sending 'bye' again
     }
 });
-
 
 // --- WebRTC Configuration ---
 const pcConfig = {
     iceServers: [
-        // Using public Google STUN servers
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        // Add TURN servers here if needed for complex networks
-        // {
-        //   urls: 'turn:your-turn-server.com:3478',
-        //   username: 'user',
-        //   credential: 'password'
-        // }
+        // Add TURN servers here if needed
     ]
 };
 
 // --- Event Listeners for Buttons ---
-startButton.onclick = startCamera;
+startMicButton.onclick = startMic;
 callButton.onclick = startCall;
-hangupButton.onclick = handleHangup;
+hangupButton.onclick = () => handleHangup(true); // Pass true to send 'bye'
 
 // --- Core Functions ---
 
-async function startCamera() {
-    console.log('Requesting local media stream...');
-    startButton.disabled = true;
+async function startMic() {
+    console.log('Requesting local media stream (audio only)...');
+    updateStatus('Requesting Mic access...');
+    startMicButton.disabled = true;
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-        console.log('Received local stream');
-        localVideo.srcObject = stream;
+        // Request audio only
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        console.log('Received local audio stream');
         localStream = stream;
         callButton.disabled = false; // Enable call button
+        updateStatus('Mic ready. You can now Call.');
+        // We don't need to display local audio, browser handles loopback internally if needed
     } catch (e) {
         console.error('getUserMedia() error:', e);
-        alert(`Error getting media: ${e.name}`);
-        startButton.disabled = false; // Re-enable if failed
+        alert(`Error getting microphone: ${e.name}\n\nPlease ensure you grant permission.`);
+        updateStatus(`Error: ${e.message}`);
+        startMicButton.disabled = false; // Re-enable if failed
     }
 }
 
 function createPeerConnection() {
     console.log('Creating Peer Connection');
+    updateStatus('Setting up connection...');
     try {
         peerConnection = new RTCPeerConnection(pcConfig);
-
-        // Event handler for when remote peer adds a track
         peerConnection.ontrack = handleRemoteTrack;
-
-        // Event handler for when finding ICE candidates
         peerConnection.onicecandidate = handleIceCandidate;
-
-        // Event handler for ICE connection state changes (useful for debugging)
         peerConnection.oniceconnectionstatechange = handleIceConnectionStateChange;
-
         console.log('RTCPeerConnection created');
 
         // Add local stream tracks to the connection
         localStream.getTracks().forEach(track => {
-            console.log('Adding local track:', track.kind);
-            peerConnection.addTrack(track, localStream);
+            if (track.kind === 'audio') { // Ensure we only add audio
+                 console.log('Adding local audio track');
+                 peerConnection.addTrack(track, localStream);
+            }
         });
         console.log('Local tracks added');
 
     } catch (e) {
         console.error('Failed to create PeerConnection:', e);
         alert('Cannot create RTCPeerConnection object.');
+        updateStatus('Connection setup failed.');
         return;
     }
 }
 
 async function startCall() {
     console.log('Starting call');
+    updateStatus('Calling...');
     callButton.disabled = true;
     hangupButton.disabled = false;
     isCaller = true;
@@ -118,61 +119,94 @@ async function startCall() {
 
     try {
         console.log('Creating offer...');
-        const offer = await peerConnection.createOffer();
+        const offer = await peerConnection.createOffer({
+             // Optional: Offer audio only explicitly if needed (usually defaults work)
+             // offerToReceiveAudio: 1,
+             // offerToReceiveVideo: 0
+        });
         await peerConnection.setLocalDescription(offer);
         console.log('Offer created and set as local description');
         console.log('Sending offer to peer');
-        // Send the offer via signaling server
+        updateStatus('Sending call request...');
         sendMessage({ type: 'offer', sdp: offer.sdp });
     } catch (e) {
         console.error('Error creating or sending offer:', e);
-        handleHangup(); // Clean up on error
+        updateStatus('Call initiation failed.');
+        handleHangup(false); // Clean up on error
     }
 }
 
 async function handleOffer(offerSdp) {
-    if (!peerConnection) { // If we haven't created connection yet (e.g., receiving call)
-        createPeerConnection();
+     // Only process offer if we aren't already in a call or calling
+    if (peerConnection) {
+         console.warn("Received offer but connection already exists. Ignoring.");
+         return; // Avoid processing if already connected or calling
+    }
+    if (!localStream) {
+        console.warn("Received call but mic is not ready. Informing user.");
+        updateStatus("Incoming call, please Start Mic first!");
+        // Optional: Send a signal back indicating busy or mic not ready
+        return;
     }
 
+    isCaller = false; // We are receiving the call
+    createPeerConnection();
+
     console.log('Received offer, setting remote description');
+    updateStatus('Incoming call...');
     try {
         await peerConnection.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offerSdp }));
         console.log('Remote description set from offer');
         console.log('Creating answer...');
+        updateStatus('Answering call...');
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
         console.log('Answer created and set as local description');
         console.log('Sending answer to peer');
-        // Send the answer via signaling server
         sendMessage({ type: 'answer', sdp: answer.sdp });
 
-        // Update UI (already in call now)
+        // Update UI (now in call)
         callButton.disabled = true;
         hangupButton.disabled = false;
+        startMicButton.disabled = true; // Can't restart mic while in call
+        updateStatus('Call Connected!'); // Update status once answer sent
 
     } catch (e) {
         console.error('Error handling offer or creating answer:', e);
-        handleHangup();
+        updateStatus('Failed to answer call.');
+        handleHangup(false);
     }
 }
 
 async function handleAnswer(answerSdp) {
+    // Only process answer if we were the caller and have a connection
+     if (!isCaller || !peerConnection || peerConnection.signalingState !== 'have-local-offer') {
+        console.warn("Received answer but wasn't expecting one. Ignoring.");
+        return;
+    }
+
     console.log('Received answer, setting remote description');
+    updateStatus('Call answered, connecting...');
     try {
         await peerConnection.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: answerSdp }));
         console.log('Remote description set from answer');
-        // Connection should now be established or establishing
+        // Status usually updates fully on ICE connection completion
+        // updateStatus('Call Connected!'); // Can be set here or wait for ICE state 'connected'
     } catch (e) {
         console.error('Error setting remote description from answer:', e);
-        handleHangup();
+        updateStatus('Failed to process answer.');
+        handleHangup(false);
     }
 }
 
 async function handleCandidate(candidateData) {
+    if (!peerConnection || peerConnection.signalingState === 'closed') {
+        console.warn("Received ICE candidate but connection is not ready or closed. Ignoring.");
+        return;
+    }
     console.log('Received ICE candidate');
+    // updateStatus('Exchanging connection details...'); // Can be noisy
     try {
-        // Create RTCIceCandidate object from the received data
         const candidate = new RTCIceCandidate({
             sdpMLineIndex: candidateData.label,
             candidate: candidateData.candidate
@@ -180,43 +214,37 @@ async function handleCandidate(candidateData) {
         await peerConnection.addIceCandidate(candidate);
         console.log('Added received ICE candidate');
     } catch (e) {
-        // Ignore benign errors like candidate already added or connection closed
-        if (!e.message.includes("Cannot add ICE candidate")) {
+        if (!e.message.includes("Cannot add ICE candidate") && !e.message.includes("already been gathered")) {
            console.error('Error adding received ICE candidate:', e);
+           // updateStatus('Connection negotiation error.'); // Inform user
         }
     }
 }
-
 
 function handleRemoteTrack(event) {
     console.log('Remote track received:', event.track.kind);
-    if (event.streams && event.streams[0]) {
-        // Don't set srcObject again if it's already set.
-        if (remoteVideo.srcObject !== event.streams[0]) {
-            remoteVideo.srcObject = event.streams[0];
-            remoteStream = event.streams[0];
-            console.log('Assigned remote stream to remoteVideo element');
+    // Only handle audio tracks
+    if (event.track.kind === 'audio') {
+        if (remoteAudio.srcObject !== event.streams[0]) {
+            console.log('Assigning remote stream to remoteAudio element');
+            remoteAudio.srcObject = event.streams[0];
+            remoteStream = event.streams[0]; // Keep reference if needed
+
+             // Make sure it plays (browsers might block autoplay without interaction)
+            remoteAudio.play().catch(e => console.warn("Remote audio play failed:", e));
         }
     } else {
-        // Fallback for older browser versions or specific scenarios
-        if (!remoteStream) {
-             remoteStream = new MediaStream();
-             remoteVideo.srcObject = remoteStream;
-        }
-        remoteStream.addTrack(event.track);
-         console.log('Added remote track to fallback stream');
+        console.log("Ignoring non-audio track:", event.track.kind);
     }
 }
 
-
 function handleIceCandidate(event) {
     if (event.candidate) {
-        console.log('Found ICE candidate:', event.candidate.candidate);
-        // Send the candidate via signaling server
+        console.log('Found ICE candidate:', event.candidate.candidate ? event.candidate.candidate.substring(0, 40) + '...' : '(empty candidate)');
         sendMessage({
             type: 'candidate',
             label: event.candidate.sdpMLineIndex,
-            id: event.candidate.sdpMid, // Usually not needed for recipient but good practice
+            id: event.candidate.sdpMid,
             candidate: event.candidate.candidate
         });
     } else {
@@ -226,88 +254,129 @@ function handleIceCandidate(event) {
 
 function handleIceConnectionStateChange() {
     if (peerConnection) {
-        console.log('ICE connection state change:', peerConnection.iceConnectionState);
-        // Possible states: 'new', 'checking', 'connected', 'completed', 'disconnected', 'failed', 'closed'
-        if (peerConnection.iceConnectionState === 'failed' ||
-            peerConnection.iceConnectionState === 'disconnected' ||
-            peerConnection.iceConnectionState === 'closed') {
-            console.warn(`ICE connection state is ${peerConnection.iceConnectionState}. May need to hang up.`);
-            // Optionally, attempt ICE restart or just hang up
-            // handleHangup(); // Be cautious with auto-hangup here
+        const state = peerConnection.iceConnectionState;
+        console.log('ICE connection state change:', state);
+        switch (state) {
+            case 'checking':
+                updateStatus('Connecting...');
+                break;
+            case 'connected': // P2P connection active (usually)
+                 // Might sometimes jump straight to 'completed'
+                updateStatus('Call Connected!');
+                startMicButton.disabled = true; // Ensure mic button disabled once fully connected
+                callButton.disabled = true;
+                hangupButton.disabled = false;
+                break;
+            case 'completed': // All ICE negotiations finished
+                 // updateStatus('Connection check complete.'); // Already shows 'Connected' usually
+                 break;
+            case 'disconnected':
+                updateStatus('Connection lost. Trying to reconnect...');
+                // WebRTC might automatically try to reconnect (ICE restart)
+                break;
+            case 'failed':
+                updateStatus('Connection failed. Please hang up.');
+                // Requires user action (hangup)
+                handleHangup(false); // Or automatically hang up? Be careful.
+                break;
+            case 'closed':
+                updateStatus('Connection closed.');
+                // State after hangup or irrecoverable failure
+                break;
         }
     }
 }
 
+// Modified hangup to accept a flag for sending 'bye' signal
+function handleHangup(notifyPeer = true) {
+    console.log('Ending call. Notify peer:', notifyPeer);
+    updateStatus('Ending call...');
 
-function handleHangup() {
-    console.log('Ending call');
-    if (peerConnection) {
-        peerConnection.close();
-        peerConnection = null; // Clean up the connection object
+    // Optional: Send 'bye' signal if requested (and if connection exists)
+    if (notifyPeer && peerConnection && peerConnection.signalingState !== 'closed') {
+        console.log("Sending 'bye' signal");
+        sendMessage({ type: 'bye' }); // Implement 'bye' handling below if needed
     }
-    if(localStream) {
-        localStream.getTracks().forEach(track => track.stop()); // Stop camera/mic
+
+    if (peerConnection) {
+        peerConnection.ontrack = null;
+        peerConnection.onicecandidate = null;
+        peerConnection.oniceconnectionstatechange = null;
+        // Stop transceivers (cleaner way to stop sending/receiving)
+        peerConnection.getTransceivers().forEach(transceiver => {
+           if (transceiver.stop) { // Check if stop method exists
+             transceiver.stop();
+           }
+           // Fallback for older method if needed:
+           // if (transceiver.sender && transceiver.sender.track) {
+           //     transceiver.sender.track.stop();
+           // }
+        });
+        peerConnection.close();
+        peerConnection = null;
+    }
+
+    if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
         localStream = null;
     }
-    if(remoteStream) {
-         remoteVideo.srcObject = null; // Clear remote video display
+
+    if (remoteStream) {
+         remoteAudio.srcObject = null;
          remoteStream = null;
     }
 
     // Reset UI
-    startButton.disabled = false;
     callButton.disabled = true;
     hangupButton.disabled = true;
-    isCaller = false; // Reset caller status
-    localVideo.srcObject = null; // Clear local video preview too
+    startMicButton.disabled = (socket.connected === false); // Only enable if socket is still ok
+    isCaller = false;
 
-    // Optionally notify the other peer you are hanging up via signaling
-    // sendMessage({ type: 'bye' }); // Implement 'bye' handling on server/client if needed
+    // Give a final status after cleanup
+    setTimeout(() => {
+       if (statusDiv.textContent.startsWith('Ending')) { // Only reset if still 'Ending'
+          updateStatus(socket.connected ? 'Ready' : 'Disconnected');
+       }
+    }, 500); // Short delay to allow 'closed' state to register
 
     console.log('Call ended and resources released.');
 }
 
-
 // --- Signaling Message Handling ---
 function sendMessage(message) {
-    // console.log('Sending message via SocketIO:', message);
+    console.log('Sending signal:', message.type); // SDP can be large, avoid logging fully
     socket.emit('signal', message);
 }
 
-// Listen for signaling messages from the server
 socket.on('signal', (message) => {
-    // console.log('Received message via SocketIO:', message);
+    // console.log('Received signal:', message); // Can be noisy
 
     if (!localStream && (message.type === 'offer' || message.type === 'answer')) {
-        console.warn("Received signal but local stream is not ready yet.");
-        // Potentially queue the message or request user to start camera first
+        console.warn("Received signal but local mic stream is not ready yet.");
+        // Handle offer might already check this, but defensive coding is good
+        if(message.type === 'offer') {
+             updateStatus("Incoming call, please Start Mic first!");
+        }
         return;
     }
 
     switch (message.type) {
         case 'offer':
-            // Received an offer from a peer - we are the callee
-            if (!isCaller) { // Only handle offer if we didn't initiate the call
-                 handleOffer(message.sdp);
-            }
+            handleOffer(message.sdp);
             break;
         case 'answer':
-            // Received an answer from the peer we called
-            if (isCaller) { // Only handle answer if we initiated the call
-                handleAnswer(message.sdp);
-            }
+            handleAnswer(message.sdp);
             break;
         case 'candidate':
-            // Received an ICE candidate from the peer
-            if(peerConnection) { // Only handle if connection exists
-                 handleCandidate(message);
-            }
+            handleCandidate(message);
             break;
-        // case 'bye': // Example for handling explicit hangup signal
-        //     handleHangup();
-        //     break;
+        case 'bye': // Handle explicit hangup signal from peer
+            console.log("Received 'bye' signal from peer.");
+            updateStatus('Peer hung up. Call ended.');
+            handleHangup(false); // Clean up locally, don't send 'bye' back
+            break;
         default:
-            console.log('Unrecognized message type:', message.type);
+            console.log('Unrecognized signal type:', message.type);
             break;
     }
 });
